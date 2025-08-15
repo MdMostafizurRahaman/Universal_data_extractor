@@ -1,5 +1,10 @@
 # --- Imports ---
-from playwright.sync_api import sync_playwright
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.common.by import By
+from selenium.webdriver.common.action_chains import ActionChains
+from selenium.webdriver.chrome.options import Options
+from webdriver_manager.chrome import ChromeDriverManager
 from bs4 import BeautifulSoup
 import re
 import json
@@ -8,7 +13,7 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 import asyncio
-from playwright.async_api import async_playwright
+import time
 
 # --- FastAPI Setup ---
 app = FastAPI()
@@ -20,65 +25,54 @@ app.add_middleware(
     allow_headers=["*"],
 )
 # --- Dynamic Extraction Function ---
-async def extract_data(url, data_types=["emails", "images", "tables"]):
+def extract_data(url, data_types=["emails", "images", "tables"]):
     try:
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
-            page = await browser.new_page()
-            await page.goto(url)
-            await page.wait_for_load_state("load", timeout=60000)
-            # Dynamic interaction: scroll, click buttons, handle popups
-            for _ in range(3):
-                await page.evaluate("window.scrollBy(0, document.body.scrollHeight)")
-                await page.wait_for_timeout(1000)
-
-            # Click all visible 'Load more', 'Show more', or similar buttons
+        chrome_options = Options()
+        chrome_options.add_argument("--headless")
+        chrome_options.add_argument("--disable-gpu")
+        chrome_options.add_argument("--no-sandbox")
+        driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=chrome_options)
+        driver.get(url)
+        time.sleep(3)
+        # Scroll to bottom
+        for _ in range(3):
+            driver.execute_script("window.scrollBy(0, document.body.scrollHeight)")
+            time.sleep(1)
+        # Click 'Load more', 'Show more', etc.
+        for btn in driver.find_elements(By.XPATH, "//button|//a"):
             try:
-                buttons = await page.query_selector_all("button, a")
+                text = btn.text.lower()
+                if any(x in text for x in ["load more", "show more", "more", "next"]):
+                    btn.click()
+                    time.sleep(1)
             except Exception:
-                buttons = []
-            for btn in buttons:
-                try:
-                    text = await btn.inner_text()
-                    if any(x in text.lower() for x in ["load more", "show more", "more", "next"]):
-                        await btn.click()
-                        await page.wait_for_timeout(1000)
-                except Exception:
-                    pass
-
-            # Handle popups/modals (try to close common ones)
-            for sel in ["button[aria-label='close']", "button.close", ".modal-close", ".popup-close"]:
-                try:
-                    close_btns = await page.query_selector_all(sel)
-                except Exception:
-                    close_btns = []
-                for btn in close_btns:
-                    try:
-                        await btn.click()
-                        await page.wait_for_timeout(500)
-                    except Exception:
-                        pass
-
-            html = await page.content()
-            from bs4 import BeautifulSoup
-            import re
-            soup = BeautifulSoup(html, "lxml")
-            result = {}
-            if "emails" in data_types:
-                result["emails"] = list(set(re.findall(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b", html)))
-            if "images" in data_types:
-                result["images"] = [img['src'] for img in soup.find_all("img") if img.get("src")]
-            if "tables" in data_types:
-                tables = []
-                for table in soup.find_all("table"):
-                    rows = []
-                    for tr in table.find_all("tr"):
-                        cells = [td.get_text(strip=True) for td in tr.find_all(["td", "th"])]
-                        rows.append(cells)
-                    tables.append(rows)
-                result["tables"] = tables
-            await browser.close()
-            return result
+                pass
+        # Try to close popups/modals
+        for sel in ["button[aria-label='close']", "button.close", ".modal-close", ".popup-close"]:
+            try:
+                for btn in driver.find_elements(By.CSS_SELECTOR, sel):
+                    btn.click()
+                    time.sleep(0.5)
+            except Exception:
+                pass
+        html = driver.page_source
+        soup = BeautifulSoup(html, "lxml")
+        result = {}
+        if "emails" in data_types:
+            result["emails"] = list(set(re.findall(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b", html)))
+        if "images" in data_types:
+            result["images"] = [img['src'] for img in soup.find_all("img") if img.get("src")]
+        if "tables" in data_types:
+            tables = []
+            for table in soup.find_all("table"):
+                rows = []
+                for tr in table.find_all("tr"):
+                    cells = [td.get_text(strip=True) for td in tr.find_all(["td", "th"])]
+                    rows.append(cells)
+                tables.append(rows)
+            result["tables"] = tables
+        driver.quit()
+        return result
     except Exception as e:
         import traceback
         print("Extraction error:", traceback.format_exc())
@@ -89,7 +83,11 @@ async def extract(request: Request):
     body = await request.json()
     url = body.get("url")
     data_types = body.get("data_types", ["emails", "images", "tables"])
-    result = await extract_data(url, data_types)
+    # Run Selenium in a thread to avoid blocking event loop
+    import concurrent.futures
+    loop = asyncio.get_event_loop()
+    with concurrent.futures.ThreadPoolExecutor() as pool:
+        result = await loop.run_in_executor(pool, extract_data, url, data_types)
     if isinstance(result, dict) and "error" in result:
         return {"error": result["error"]}
     # Save to Excel file
